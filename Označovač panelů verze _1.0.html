@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8">
+  <title>Označování PDF</title>
+  <style>
+    body { margin: 0; font-family: sans-serif; }
+    #controls {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      background: #f0f0f0;
+      padding: 10px;
+      z-index: 1000;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    #pdfContainer {
+      margin-top: 80px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    canvas {
+      border: 1px solid #ccc;
+      margin: 10px 0;
+    }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <select id="dimensionSelector">
+      <option data-color="#00FF00AA" value="39x86 cm">39x86 cm (zelená)</option>
+      <option data-color="#FFFF00AA" value="39x106 cm">39x106 cm (žlutá)</option>
+      <option data-color="#FFA500AA" value="39x240 cm">39x240 cm (oranžová)</option>
+      <option data-color="#FFC0CBAA" value="62x80 cm">62x80 cm (růžová)</option>
+      <option data-color="#800080AA" value="62x240 cm">62x240 cm (fialová)</option>
+    </select>
+    <input type="file" id="fileInput" accept="application/pdf">
+    <button onclick="rotatePDF()">Otočit PDF</button>
+    <button onclick="undoLast()">Zpět</button>
+    <button onclick="clearAll()">Smazat vše</button>
+    <button onclick="enableTextMode()">Přidat text</button>
+    <button onclick="enableEraseMode()">Guma</button>
+    <button onclick="downloadPDF()">Stáhnout PDF</button>
+  </div>
+
+  <div id="pdfContainer"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script>
+    let pdfDoc = null, rotation = 0, annotations = {}, scale = 1.5, textMode = false, eraseMode = false, pendingText = '';
+    const pdfContainer = document.getElementById('pdfContainer');
+    const dimensionSelector = document.getElementById('dimensionSelector');
+
+    document.getElementById('fileInput').addEventListener('change', e => {
+      const file = e.target.files[0];
+      if (file && file.type === 'application/pdf') {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const typedArray = new Uint8Array(reader.result);
+          pdfjsLib.getDocument({ data: typedArray }).promise.then(pdf => {
+            pdfDoc = pdf;
+            annotations = {};
+            renderAllPages();
+          });
+        };
+        reader.readAsArrayBuffer(file);
+      }
+    });
+
+    function renderAllPages() {
+      pdfContainer.innerHTML = '';
+      for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
+        pdfDoc.getPage(pageNum).then(page => {
+          const viewport = page.getViewport({ scale, rotation });
+          const canvas = document.createElement('canvas');
+          const ctx = canvas.getContext('2d');
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          canvas.dataset.page = page.pageNumber;
+          const renderContext = { canvasContext: ctx, viewport };
+          page.render(renderContext).promise.then(() => {
+            drawAnnotations(canvas);
+          });
+
+          canvas.addEventListener('mousedown', e => {
+            if (textMode || eraseMode) return;
+            const startX = e.offsetX, startY = e.offsetY;
+            const moveHandler = moveEvt => {
+              drawAnnotations(canvas, { tempLine: [startX, startY, moveEvt.offsetX, moveEvt.offsetY] });
+            };
+            const upHandler = upEvt => {
+              canvas.removeEventListener('mousemove', moveHandler);
+              canvas.removeEventListener('mouseup', upHandler);
+              const endX = upEvt.offsetX, endY = upEvt.offsetY;
+              const option = dimensionSelector.selectedOptions[0];
+              const color = option.dataset.color;
+              const label = option.value;
+              const page = parseInt(canvas.dataset.page);
+              if (!annotations[page]) annotations[page] = [];
+              annotations[page].push({ type: 'line', x1: startX, y1: startY, x2: endX, y2: endY, color, label });
+              drawAnnotations(canvas);
+            };
+            canvas.addEventListener('mousemove', moveHandler);
+            canvas.addEventListener('mouseup', upHandler);
+          });
+
+          canvas.addEventListener('click', e => {
+            const page = parseInt(canvas.dataset.page);
+            if (eraseMode) {
+              if (!annotations[page]) return;
+              annotations[page] = annotations[page].filter(a => {
+                if (a.type === 'line') {
+                  const x0 = e.offsetX, y0 = e.offsetY;
+                  const x1 = a.x1, y1 = a.y1, x2 = a.x2, y2 = a.y2;
+                  const A = x0 - x1;
+                  const B = y0 - y1;
+                  const C = x2 - x1;
+                  const D = y2 - y1;
+                  const dot = A * C + B * D;
+                  const len_sq = C * C + D * D;
+                  const param = len_sq !== 0 ? dot / len_sq : -1;
+                  let xx, yy;
+                  if (param < 0) { xx = x1; yy = y1; }
+                  else if (param > 1) { xx = x2; yy = y2; }
+                  else { xx = x1 + param * C; yy = y1 + param * D; }
+                  const dx = x0 - xx;
+                  const dy = y0 - yy;
+                  return Math.sqrt(dx * dx + dy * dy) > 10;
+                } else if (a.type === 'text') {
+                  const width = 100, height = 20;
+                  return !(e.offsetX >= a.x && e.offsetX <= a.x + width && e.offsetY >= a.y - height && e.offsetY <= a.y);
+                }
+                return true;
+              });
+              drawAnnotations(canvas);
+              return;
+            }
+
+            if (textMode) {
+              if (!annotations[page]) annotations[page] = [];
+              annotations[page].push({ type: 'text', content: pendingText, x: e.offsetX, y: e.offsetY });
+              drawAnnotations(canvas);
+              textMode = false;
+              pendingText = '';
+            }
+          });
+
+          pdfContainer.appendChild(canvas);
+        });
+      }
+    }
+
+    function drawAnnotations(canvas, preview = {}) {
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const page = parseInt(canvas.dataset.page);
+      pdfDoc.getPage(page).then(pageObj => {
+        const viewport = pageObj.getViewport({ scale, rotation });
+        pageObj.render({ canvasContext: ctx, viewport }).promise.then(() => {
+          const items = annotations[page] || [];
+          items.forEach(a => {
+            if (a.type === 'line') {
+              ctx.strokeStyle = a.color;
+              ctx.lineWidth = 6;
+              ctx.beginPath();
+              ctx.moveTo(a.x1, a.y1);
+              ctx.lineTo(a.x2, a.y2);
+              ctx.stroke();
+              ctx.fillStyle = '#000';
+              ctx.font = '14px Arial';
+              ctx.fillText(a.label, a.x2 + 5, a.y2 - 5);
+            }
+            if (a.type === 'text') {
+              ctx.fillStyle = '#000';
+              ctx.font = '16px Arial';
+              ctx.fillText(a.content, a.x, a.y);
+            }
+          });
+          if (preview.tempLine) {
+            ctx.strokeStyle = '#999';
+            ctx.setLineDash([5, 5]);
+            ctx.beginPath();
+            ctx.moveTo(preview.tempLine[0], preview.tempLine[1]);
+            ctx.lineTo(preview.tempLine[2], preview.tempLine[3]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+          }
+        });
+      });
+    }
+
+    function rotatePDF() {
+      rotation = (rotation + 90) % 360;
+      renderAllPages();
+    }
+
+    function undoLast() {
+      const pages = Object.keys(annotations);
+      if (!pages.length) return;
+      const lastPage = pages[pages.length - 1];
+      annotations[lastPage].pop();
+      renderAllPages();
+    }
+
+    function clearAll() {
+      annotations = {};
+      renderAllPages();
+    }
+
+    function enableTextMode() {
+      const content = prompt('Zadej text:');
+      if (!content) return;
+      textMode = true;
+      eraseMode = false;
+      pendingText = content;
+      alert('Klikněte na pozici, kam chcete text vložit.');
+    }
+
+    function enableEraseMode() {
+      eraseMode = !eraseMode;
+      textMode = false;
+      alert(eraseMode ? 'Guma ZAPNUTA. Klikněte na objekt, který chcete odstranit.' : 'Guma VYPNUTA.');
+    }
+
+    async function downloadPDF() {
+      const { jsPDF } = window.jspdf;
+      const filename = prompt('Zadejte název souboru:', 'annotated.pdf');
+      if (!filename) return;
+
+      const orientation = confirm("Chcete exportovat na šířku (Landscape)?") ? 'landscape' : 'portrait';
+      const doc = new jsPDF({ format: 'a4', orientation });
+
+      const canvases = document.querySelectorAll('canvas');
+
+      for (let i = 0; i < canvases.length; i++) {
+        const canvas = canvases[i];
+        const imgData = canvas.toDataURL('image/png');
+        const imgProps = doc.getImageProperties(imgData);
+        const pageWidth = doc.internal.pageSize.getWidth();
+        const pageHeight = doc.internal.pageSize.getHeight();
+
+        let imgWidth = pageWidth;
+        let imgHeight = (imgProps.height * pageWidth) / imgProps.width;
+        if (imgHeight > pageHeight) {
+          imgHeight = pageHeight;
+          imgWidth = (imgProps.width * pageHeight) / imgProps.height;
+        }
+        const x = (pageWidth - imgWidth) / 2;
+        const y = (pageHeight - imgHeight) / 2;
+
+        if (i > 0) doc.addPage();
+        doc.addImage(imgData, 'PNG', x, y, imgWidth, imgHeight);
+      }
+
+      doc.save(filename.endsWith('.pdf') ? filename : filename + '.pdf');
+    }
+  </script>
+</body>
+</html>
